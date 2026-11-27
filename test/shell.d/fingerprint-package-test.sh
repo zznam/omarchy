@@ -43,6 +43,14 @@ case "$1" in
     fi
     grep -qx -- "$1" <<< "${INSTALLED:-}"
     ;;
+  # Ownership query, not a transaction: answer it without logging a call.
+  # Only the library the setup cares about has an owner here, so any other path
+  # comes back unowned the way pacman answers for a file no package ships.
+  -Qqo)
+    [[ $2 == /usr/lib/libfprint-2.so.2 ]] || exit 1
+    [[ -n ${LIBFPRINT_OWNER:-} ]] || exit 1
+    echo "$LIBFPRINT_OWNER"
+    ;;
   -S)
     printf 'pacman %s\n' "$*" >> "$CALL_LOG"
     exit "${INSTALL_STATUS:-0}"
@@ -93,6 +101,25 @@ if [[ ${LOCK_SETUP_UNKNOWN:-0} != "1" ]]; then
 fi
 STUB
 chmod +x "$scratch/bin/omarchy-apply-lock"
+# Without --terminal the command reaches for the desktop: the running shell,
+# then a floating terminal. Neither is ever the real one here.
+cat > "$scratch/bin/omarchy-shell" <<'STUB'
+#!/bin/bash
+echo "shell $*" >> "$CALL_LOG"
+echo "${SHELL_ANSWER:-unknown}"
+STUB
+cat > "$scratch/bin/omarchy-launch-floating-terminal-with-presentation" <<'STUB'
+#!/bin/bash
+echo "terminal $*" >> "$CALL_LOG"
+STUB
+chmod +x "$scratch/bin/omarchy-shell" "$scratch/bin/omarchy-launch-floating-terminal-with-presentation"
+# The real PAM step skips sudo when it is already root, so a root run of this
+# test would edit the host's /etc/pam.d. Never the real one.
+cat > "$scratch/bin/omarchy-apply-fingerprint-pam" <<'STUB'
+#!/bin/bash
+echo "pam apply" >> "$CALL_LOG"
+STUB
+chmod +x "$scratch/bin/omarchy-apply-fingerprint-pam"
 
 export TEST_LOCK_PAM="$scratch/omarchy-lock-fingerprint"
 setup_script="$scratch/omarchy-setup-security-fingerprint"
@@ -101,7 +128,7 @@ chmod +x "$setup_script"
 
 run_setup() {
   : > "$CALL_LOG"
-  if OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1; then
+  if OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1; then
     fail "setup stops on the simulated enrollment or installation failure"
   fi
   if grep -Eq '^(pam |apply-lock$|Unexpected privileged call)' "$CALL_LOG"; then
@@ -111,6 +138,13 @@ run_setup() {
 
 assert_installs() {
   grep -qx 'pacman -S --needed --noconfirm --ask 4 -- libfprint-git fprintd usbutils' "$CALL_LOG" || fail "$1"
+  (( $(grep -c '^pacman ' "$CALL_LOG") == 1 )) || fail "$1: one pacman transaction"
+}
+
+assert_keeps_driver() {
+  grep -qx 'pacman -S --needed --noconfirm --ask 4 -- fprintd usbutils' "$CALL_LOG" ||
+    fail "$1"
+  grep -q 'libfprint-git' "$CALL_LOG" && fail "$1: libfprint-git is not installed"
   (( $(grep -c '^pacman ' "$CALL_LOG") == 1 )) || fail "$1: one pacman transaction"
 }
 
@@ -143,7 +177,7 @@ pass "missing hardware performs no package operations"
 # Successful setup must reuse the same lock/recovery installer as updates.
 : > "$CALL_LOG"
 OMARCHY_PATH="$scratch" ENROLL_STATUS=0 VERIFY_STATUS=0 \
-  "$setup_script" > "$scratch/output" 2>&1 || fail "successful enrollment configures authentication"
+  "$setup_script" --terminal > "$scratch/output" 2>&1 || fail "successful enrollment configures authentication"
 [[ $(grep -E '^(enroll|verify|apply-lock)$' "$CALL_LOG") == $'enroll\nverify\napply-lock' ]] ||
   fail "setup configures lock recovery once, after enrollment and verification"
 pass "setup reuses apply-lock after enrollment and verification"
@@ -154,7 +188,7 @@ pass "setup reuses apply-lock after enrollment and verification"
   fail "the platform turns its reader on before enrollment, resolved as the user first" "$(cat "$CALL_LOG")"
 : > "$CALL_LOG"
 if INSTALLED=$'libfprint-git\nfprintd\nusbutils' ENABLE_STATUS=1 ENROLL_STATUS=0 VERIFY_STATUS=0 \
-  OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1; then
+  OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1; then
   fail "a reader the owner doesn't turn on stops setup"
 fi
 ! grep -Eq '^(enroll|verify|apply-lock|pam .*)$' "$CALL_LOG" && grep -q 'was not turned on, so nothing was enrolled' "$scratch/output" ||
@@ -162,7 +196,7 @@ fi
 # The owner may read past sudo's timeout, so sudo is checked again after the hook.
 : > "$CALL_LOG"
 INSTALLED=$'libfprint-git\nfprintd\nusbutils' ENROLL_STATUS=0 VERIFY_STATUS=0 \
-  OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 || fail "setup with a platform hook succeeds"
+  OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1 || fail "setup with a platform hook succeeds"
 [[ $(grep -E '^(dispatch .*|sudo authenticated|enroll)$' "$CALL_LOG") == $'sudo authenticated\ndispatch enable-fingerprint\nsudo authenticated\nenroll' ]] &&
   grep -qF "Confirm it's you again." "$scratch/output" ||
   fail "sudo is checked again after the platform hook, before enrolling" "$(cat "$CALL_LOG")"
@@ -173,19 +207,19 @@ pass "the platform turns its reader on before enrollment, and setup stops if it 
 # stays off, and any other reader enrolls as on every platform.
 : > "$CALL_LOG"
 INSTALLED=$'libfprint-git\nfprintd\nusbutils' ENABLE_HOOK= ENROLL_STATUS=0 VERIFY_STATUS=0 \
-  OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 || fail "a platform without the hook sets up as before"
+  OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1 || fail "a platform without the hook sets up as before"
 ! grep -q '^dispatch ' "$CALL_LOG" && grep -qx enroll "$CALL_LOG" ||
   fail "a platform without the hook enrolls without a privileged dispatch" "$(cat "$CALL_LOG")"
 : > "$CALL_LOG"
 INSTALLED=$'libfprint-git\nfprintd\nusbutils' RESOLVE_STATUS=2 ENROLL_STATUS=0 VERIFY_STATUS=0 \
-  OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 || fail "a hook that can't be resolved doesn't stop setup" "$(cat "$scratch/output")"
+  OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1 || fail "a hook that can't be resolved doesn't stop setup" "$(cat "$scratch/output")"
 ! grep -q '^dispatch ' "$CALL_LOG" && grep -qx enroll "$CALL_LOG" && grep -q "couldn't be checked, so a reader the platform keeps off stays off" "$scratch/output" ||
   fail "a hook that can't be resolved runs nothing as root, enrolls as before and says so" "$(cat "$CALL_LOG"; cat "$scratch/output")"
 pass "a platform without the hook runs nothing as root for it, and one that can't be told sets up as before"
 
 rm -f "$TEST_LOCK_PAM"
 if OMARCHY_PATH="$scratch" ENROLL_STATUS=0 VERIFY_STATUS=0 LOCK_SETUP_UNKNOWN=1 \
-  "$setup_script" > "$scratch/output" 2>&1; then
+  "$setup_script" --terminal > "$scratch/output" 2>&1; then
   fail "an inconclusive lock installer cannot report successful lock setup"
 fi
 grep -q 'lock-screen configuration could not be confirmed' "$scratch/output" || fail "inconclusive setup explains how to retry"
@@ -222,7 +256,7 @@ pass "each scan type gets its own instruction, and an unnamed one is told to tou
 check_verify_prompt() {
   : > "$CALL_LOG"
   INSTALLED=$'libfprint-git\nfprintd\nusbutils' SCAN_TYPE=$1 ENROLL_STATUS=0 VERIFY_STATUS=1 \
-    OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 || true
+    OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1 || true
   grep -qF "Now let's verify that it's working correctly. $2" "$scratch/output" ||
     fail "a ${1:-unnamed} sensor is asked to verify with: $2" "$(cat "$scratch/output")"
 }
@@ -254,7 +288,7 @@ pass "enrollment results read as instructions, and a failed enrollment still fai
 # success path's order is checked above.
 : > "$CALL_LOG"
 if INSTALLED=$'libfprint-git\nfprintd\nusbutils' SCAN_TYPE=press ENROLL_STATUS=0 VERIFY_STATUS=1 \
-  OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1; then
+  OMARCHY_PATH="$scratch" "$setup_script" --terminal > "$scratch/output" 2>&1; then
   fail "a failed verify fails setup" "$(cat "$scratch/output")"
 fi
 grep -qx verify "$CALL_LOG" && ! grep -Eq '^(pam |apply-lock$|Unexpected privileged call)' "$CALL_LOG" ||
@@ -326,37 +360,51 @@ pass "a failed sudo stops setup with a reason, before enrolling"
   fail "any verify result that isn't done is a retry"
 pass "every retry keeps the step going, and only a finished failure says it stopped"
 
-# Each of fprintd 1.94.5's enroll and verify results, one by one.
-check_enroll() {
-  [[ $(printf 'Enroll result: %s\n' "$1" | enroll_progress "Again.") == "$2" ]] ||
-    fail "enroll result $1 reads as: $2" "$(printf 'Enroll result: %s\n' "$1" | enroll_progress "Again.")"
-}
-check_enroll enroll-completed $'  ✓ Enrolled.'
-check_enroll enroll-retry-scan "  That one didn't read. Again."
-check_enroll enroll-swipe-too-short '  Too short. Again.'
-check_enroll enroll-finger-not-centered '  Not centered: use the middle of the sensor. Again.'
-check_enroll enroll-remove-and-retry '  Lift your finger off the sensor, then try again.'
-check_enroll enroll-too-fast '  Too fast. Again.'
-check_enroll enroll-duplicate $'  ✗ That finger is already enrolled.'
-check_enroll enroll-data-full $'  ✗ The reader has no room for another fingerprint.'
-check_enroll enroll-disconnected $'  ✗ The reader was disconnected.'
-for result in enroll-failed enroll-unknown-error; do
-  check_enroll "$result" $'  ✗ Enrollment stopped. If you stopped before it said Enrolled, run this again and keep going.'
-done
-check_verify() {
-  [[ $(printf 'Verify result: %s\n' "$1" | verify_progress "Again.") == "$2" ]] ||
-    fail "verify result $1 reads as: $2" "$(printf 'Verify result: %s\n' "$1" | verify_progress "Again.")"
-}
-check_verify 'verify-match (done)' $'  ✓ Matched.'
-check_verify 'verify-no-match (done)' $'  ✗ No match.'
-check_verify 'verify-retry-scan (not done)' "  That one didn't read. Again."
-check_verify 'verify-swipe-too-short (not done)' '  Too short. Again.'
-check_verify 'verify-finger-not-centered (not done)' '  Not centered: use the middle of the sensor. Again.'
-check_verify 'verify-remove-and-retry (not done)' '  Lift your finger off the sensor, then try again.'
-# The line names no gesture, so it reads right on press and swipe readers alike.
-[[ $(printf 'Enroll result: enroll-remove-and-retry\n' | enroll_progress "Swipe it again.") == '  Lift your finger off the sensor, then try again.' ]] ||
-  fail "a swipe reader asked to lift its finger isn't told to touch"
-check_verify 'verify-too-fast (not done)' '  Too fast. Again.'
-check_verify 'verify-disconnected (done)' $'  ✗ The reader was disconnected.'
-check_verify 'verify-unknown-error (done)' $'  ✗ The check stopped (verify-unknown-error).'
-pass "each enroll and verify result fprintd 1.94.5 sends reads as intended"
+# Readers libfprint cannot drive at all run on a TOD stack -- a libfprint fork
+# plus a vendor blob -- and that fork provides libfprint-2.so.2 itself. --ask 4
+# would accept its removal silently, leaving the machine with no driver, so the
+# owner of the library decides whether libfprint-git may replace it.
+LIBFPRINT_OWNER=libfprint-tod INSTALLED=$'libfprint-tod' run_setup
+assert_keeps_driver "a TOD-provided libfprint is kept instead of being replaced"
+pass "a TOD-provided libfprint is kept and libfprint-git is skipped"
+
+# The TOD packages are named differently per vendor, so the check has to follow
+# the library's owner rather than any one package name.
+LIBFPRINT_OWNER=libfprint-tod-git INSTALLED=$'libfprint-tod-git' run_setup
+assert_keeps_driver "a differently named TOD package is kept too"
+pass "the driver is kept by library ownership, not by package name"
+
+LIBFPRINT_OWNER=libfprint-tod INSTALLED=$'libfprint-tod\nfprintd\nusbutils' run_setup
+if grep -q '^pacman ' "$CALL_LOG"; then
+  fail "a TOD machine with everything installed does not touch pacman"
+fi
+grep -qx enroll "$CALL_LOG" || fail "a TOD machine with everything installed reaches enrollment"
+pass "a TOD machine with everything installed goes straight to enrollment"
+
+LIBFPRINT_OWNER=libfprint run_setup
+assert_installs "stock libfprint is still replaced by libfprint-git"
+pass "stock libfprint is still replaced by libfprint-git"
+
+LIBFPRINT_OWNER=libfprint-git INSTALLED=$'libfprint-git' run_setup
+assert_installs "an existing libfprint-git still completes the package set"
+pass "an existing libfprint-git still completes the package set"
+
+# On the desktop the command hands over to the fingerprint panel and does
+# nothing itself; --terminal, as every run above, never asks the shell.
+: > "$CALL_LOG"
+SHELL_ANSWER=ok OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 ||
+  fail "setup succeeds once the panel is summoned" "$(cat "$scratch/output")"
+[[ $(<"$CALL_LOG") == "shell shell summon omarchy.fingerprint" ]] ||
+  fail "setup on the desktop only summons the panel" "$(cat "$CALL_LOG")"
+run_setup
+grep -q '^shell ' "$CALL_LOG" && fail "setup --terminal leaves the shell alone" "$(cat "$CALL_LOG")"
+pass "setup summons the fingerprint panel on the desktop and runs in place with --terminal"
+
+# With the panel unavailable (the plugin disabled, say) and no terminal to ask
+# on, as from the menu or the first-run notification, setup opens one.
+: > "$CALL_LOG"
+OMARCHY_PATH="$scratch" "$setup_script" > "$scratch/output" 2>&1 < /dev/null ||
+  fail "setup without the panel or a terminal succeeds by opening one" "$(cat "$scratch/output")"
+[[ $(<"$CALL_LOG") == $'shell shell summon omarchy.fingerprint\nterminal omarchy-setup-security-fingerprint --terminal' ]] ||
+  fail "setup without the panel or a terminal opens the terminal setup and nothing else" "$(cat "$CALL_LOG")"
+pass "setup opens a floating terminal when it has neither the panel nor a terminal"
